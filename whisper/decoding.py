@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 from torch.distributions import Categorical
+import kenlm
 
 from .audio import CHUNK_LENGTH
 from .tokenizer import Tokenizer, get_tokenizer
@@ -32,7 +33,9 @@ def detect_language(
         list of dictionaries containing the probability distribution over all languages.
     """
     if tokenizer is None:
-        tokenizer = get_tokenizer(model.is_multilingual)
+        tokenizer = get_tokenizer(
+            model.is_multilingual, num_languages=model.num_languages
+        )
     if (
         tokenizer.language is None
         or tokenizer.language_token not in tokenizer.sot_sequence
@@ -111,6 +114,12 @@ class DecodingOptions:
     # implementation details
     fp16: bool = True  # use fp16 for most of the calculation
 
+    #with LM
+    withlm: bool = False
+    lm_path: str = None
+    lm_alpha: float = 2.0
+    lm_beta: float = 2.5
+    return_nbest: bool = False
 
 @dataclass(frozen=True)
 class DecodingResult:
@@ -294,6 +303,161 @@ class GreedyDecoder(TokenDecoder):
         # make sure each sequence has at least one EOT token at the end
         tokens = F.pad(tokens, (0, 1), value=self.eot)
         return tokens, sum_logprobs.tolist()
+
+class BeamSearchDecoderWithLM(TokenDecoder):
+    def __init__(
+        self,
+        beam_size: int,
+        eot: int,
+        inference: Inference,
+        patience: Optional[float] = None,
+        lm_path: Optional[str] = None, 
+        lm_alpha: Optional[float] = 0.5, 
+        lm_beta: Optional[float] = 0.5):
+        self.beam_size = beam_size
+        self.eot = eot
+        self.inference = inference
+        self.patience = patience or 1.0
+        self.max_candidates: int = round(beam_size * self.patience)
+        self.finished_sequences = None
+        self.lm: "kenlm.Model" = kenlm.Model(lm_path) if lm_path else None
+        self.tokenizer = get_tokenizer('hi')
+        self.lm_alpha = lm_alpha
+        self.lm_beta = lm_beta
+
+        assert (
+            self.max_candidates > 0
+        ), f"Invalid beam size ({beam_size}) or patience ({patience})"
+
+    def reset(self):
+        self.finished_sequences = None
+
+    def update(
+        self, tokens: Tensor, logits: Tensor, sum_logprobs: Tensor
+    ) -> Tuple[Tensor, bool]:
+        if tokens.shape[0] % self.beam_size != 0:
+            raise ValueError(f"{tokens.shape}[0] % {self.beam_size} != 0")
+
+        n_audio = tokens.shape[0] // self.beam_size
+        if self.finished_sequences is None:  # for the first update
+            self.finished_sequences = [{} for _ in range(n_audio)]
+
+        logprobs = F.log_softmax(logits.float(), dim=-1)
+        # https://github.com/openai/whisper/discussions/361
+        # we only use tokenizer token, all token id after 50364 and 50364 are all timestamp tokens
+        # because we pass without_timestamp=True to tokenizer, we only get token id < 50364
+        # logprobs_for_lm = F.log_softmax(logits.float(), dim=-1)[:, :self.tokenizer.tokenizer.vocab_size + 1]
+        # print(dir(self.tokenizer.encoding)) # ['__class__', '__delattr__', '__dict__', '__dir__', '__doc__', '__eq__', '__format__', '__ge__', '__getattribute__', '__gt__', '__hash__', '__init__', '__init_subclass__', '__le__', '__lt__', '__module__', '__ne__', '__new__', '__reduce__', '__reduce_ex__', '__repr__', '__setattr__', '__sizeof__', '__str__', '__subclasshook__', '__weakref__', '_core_bpe', '_encode_bytes', '_encode_only_native_bpe', '_encode_single_piece', '_mergeable_ranks', '_pat_str', '_special_tokens', 'decode', 'decode_batch', 'decode_bytes', 'decode_bytes_batch', 'decode_single_token_bytes', 'decode_tokens_bytes', 'decode_with_offsets', 'encode', 'encode_batch', 'encode_ordinary', 'encode_ordinary_batch', 'encode_single_token', 'encode_with_unstable', 'eot_token', 'max_token_value', 'n_vocab', 'name', 'special_tokens_set', 'token_byte_values']
+
+        logprobs_for_lm = F.log_softmax(logits.float(), dim=-1)[:, :self.tokenizer.encoding.n_vocab - 1501]
+
+        next_tokens, source_indices, finished_sequences = [], [], []
+
+        for i in range(int(n_audio)):
+            scores, sources, finished = {}, {}, {}
+
+            # STEP 1: calculate the cumulative log probabilities for possible candidates
+            for j in range(self.beam_size):
+                idx = i * self.beam_size + j
+                prefix = tokens[idx].tolist()
+                #########Calculate LM logprobs########
+                # we skip first 4 special tokens
+                if (len(prefix) > 4):
+                    curr_state = kenlm.State()
+                    next_state = kenlm.State()
+                    self.lm.BeginSentenceWrite(curr_state)
+                    lm_score = []
+                    prob = 0.0
+                    for k in range(len(prefix[4:])):
+                        # chr(prefix[k + 4] + 100) since we encode the text with 100 offset
+                        # https://github.com/NVIDIA/NeMo/blob/stable/scripts/asr_language_modeling/ngram_lm/kenlm_utils.py
+                        prob += self.lm.BaseScore(curr_state, chr(prefix[k + 4] + 100), next_state)
+                        curr_state, next_state = next_state, curr_state
+                    # save last state so that we do not have to recompute the whole sentence
+                    last_state = curr_state
+                    # calculate all log10 probabilities of all tokens
+                    # this is not efficient: https://github.com/kpu/kenlm/issues/367
+                    # for k in range(self.tokenizer.tokenizer.vocab_size):
+                    for k in range(self.tokenizer.encoding.n_vocab - 1502):
+                        new_token_state = kenlm.State()
+                        new_token_score = self.lm.BaseScore(last_state, chr(k + 100), new_token_state)
+                        lm_score.append(new_token_score)
+
+                    # add <endoftext> token's probability, which is </s> in kenlm
+                    lm_score.append(self.lm.BaseScore(last_state, "</s>", new_token_state))
+                    # lm_score = torch.FloatTensor(lm_score, device=tokens.device)
+                    lm_score = torch.FloatTensor(lm_score).to(tokens.device)
+                    
+                    # common shallow fusion
+                    temp_logprobs_idx = logprobs_for_lm[idx] + self.lm_alpha*lm_score
+                else:
+                    temp_logprobs_idx = logprobs_for_lm[idx]
+
+                #################
+
+                for logprob, token in zip(*temp_logprobs_idx.topk(self.beam_size + 1)):
+                    new_logprob = (sum_logprobs[idx] + logprob).item()
+                    sequence = tuple(prefix + [token.item()])
+                    scores[sequence] = new_logprob
+                    sources[sequence] = idx
+
+            # STEP 2: rank the candidates and keep the top beam_size sequences for each audio
+            saved = 0
+            for sequence in sorted(scores, key=scores.get, reverse=True):
+                if sequence[-1] == self.eot:
+                    finished[sequence] = scores[sequence]
+                else:
+                    sum_logprobs[len(next_tokens)] = scores[sequence]
+                    next_tokens.append(sequence)
+                    source_indices.append(sources[sequence])
+
+                    saved += 1
+                    if saved == self.beam_size:
+                        break
+
+            finished_sequences.append(finished)
+
+        tokens = torch.tensor(next_tokens, device=tokens.device)
+        self.inference.rearrange_kv_cache(source_indices)
+
+        # add newly finished sequences to self.finished_sequences
+        assert len(self.finished_sequences) == len(finished_sequences)
+        for previously_finished, newly_finished in zip(
+            self.finished_sequences, finished_sequences
+        ):
+            for seq in sorted(newly_finished, key=newly_finished.get, reverse=True):
+                if len(previously_finished) >= self.max_candidates:
+                    break  # the candidate list is full
+                previously_finished[seq] = newly_finished[seq]
+
+        # mark as completed if all audio has enough number of samples
+        completed = all(
+            len(sequences) >= self.max_candidates
+            for sequences in self.finished_sequences
+        )
+        return tokens, completed
+
+    def finalize(self, preceding_tokens: Tensor, sum_logprobs: Tensor):
+        # collect all finished sequences, including patience, and add unfinished ones if not enough
+        sum_logprobs = sum_logprobs.cpu()
+        for i, sequences in enumerate(self.finished_sequences):
+            if (
+                len(sequences) < self.beam_size
+            ):  # when not enough sequences are finished
+                for j in list(np.argsort(sum_logprobs[i]))[::-1]:
+                    sequence = preceding_tokens[i, j].tolist() + [self.eot]
+                    sequences[tuple(sequence)] = sum_logprobs[i][j].item()
+                    if len(sequences) >= self.beam_size:
+                        break
+
+        tokens: List[List[Tensor]] = [
+            [torch.tensor(seq) for seq in sequences.keys()]
+            for sequences in self.finished_sequences
+        ]
+        sum_logprobs: List[List[float]] = [
+            list(sequences.values()) for sequences in self.finished_sequences
+        ]
+        return tokens, sum_logprobs
 
 
 class BeamSearchDecoder(TokenDecoder):
@@ -514,7 +678,10 @@ class DecodingTask:
 
         language = options.language or "en"
         tokenizer = get_tokenizer(
-            model.is_multilingual, language=language, task=options.task
+            model.is_multilingual,
+            num_languages=model.num_languages,
+            language=language,
+            task=options.task,
         )
         self.tokenizer: Tokenizer = tokenizer
         self.options: DecodingOptions = self._verify_options(options)
@@ -539,9 +706,15 @@ class DecodingTask:
 
         # decoder: implements how to select the next tokens, given the autoregressive distribution
         if options.beam_size is not None:
-            self.decoder = BeamSearchDecoder(
-                options.beam_size, tokenizer.eot, self.inference, options.patience
-            )
+            if (options.withlm):
+                self.decoder = BeamSearchDecoderWithLM(
+                    options.beam_size, tokenizer.eot, self.inference, options.patience, 
+                    options.lm_path, options.lm_alpha, options.lm_beta
+                )
+            else:
+                self.decoder = BeamSearchDecoder(
+                    options.beam_size, tokenizer.eot, self.inference, options.patience
+                )
         else:
             self.decoder = GreedyDecoder(options.temperature, tokenizer.eot)
 
@@ -745,43 +918,73 @@ class DecodingTask:
             [t[self.sample_begin : (t == tokenizer.eot).nonzero()[0, 0]] for t in s]
             for s in tokens
         ]
+        if self.options.return_nbest:
+            n_best = 10
+            # Select all candidates for each group
+            # selected_candidates = self.sequence_ranker.rank(tokens, sum_logprobs)
+            all_candidates = [[t[i].tolist() for i in range(len(t))] for t in tokens]
 
-        # select the top-ranked sample in each group
-        selected = self.sequence_ranker.rank(tokens, sum_logprobs)
-        tokens: List[List[int]] = [t[i].tolist() for i, t in zip(selected, tokens)]
-        texts: List[str] = [tokenizer.decode(t).strip() for t in tokens]
+            # Decode candidates
+            all_texts = [[tokenizer.decode(t).strip() for t in candidates] for candidates in all_candidates]
 
-        sum_logprobs: List[float] = [lp[i] for i, lp in zip(selected, sum_logprobs)]
-        avg_logprobs: List[float] = [
-            lp / (len(t) + 1) for t, lp in zip(tokens, sum_logprobs)
-        ]
+            # Prepare the result
+            results = []
+            for group_idx, (candidates, texts, logprobs) in enumerate(zip(all_candidates, all_texts, sum_logprobs)):
+                n_best_results = []
+                for candidate_idx, (tokens, text, logprob) in enumerate(zip(candidates, texts, logprobs)):
+                    n_best_results.append(
+                        DecodingResult(
+                            audio_features=audio_features[group_idx],
+                            language=languages[group_idx],
+                            tokens=tokens,
+                            text=text,
+                            avg_logprob=logprob / (len(tokens) + 1),
+                            no_speech_prob=no_speech_probs[group_idx],
+                            temperature=self.options.temperature,
+                            compression_ratio=compression_ratio(text),
+                        )
+                    )
+                results.append(n_best_results[:n_best])
 
-        fields = (
-            texts,
-            languages,
-            tokens,
-            audio_features,
-            avg_logprobs,
-            no_speech_probs,
-        )
-        if len(set(map(len, fields))) != 1:
-            raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
+            return results
+        else:
 
-        return [
-            DecodingResult(
-                audio_features=features,
-                language=language,
-                tokens=tokens,
-                text=text,
-                avg_logprob=avg_logprob,
-                no_speech_prob=no_speech_prob,
-                temperature=self.options.temperature,
-                compression_ratio=compression_ratio(text),
+            # select the top-ranked sample in each group
+            selected = self.sequence_ranker.rank(tokens, sum_logprobs)
+            tokens: List[List[int]] = [t[i].tolist() for i, t in zip(selected, tokens)]
+            texts: List[str] = [tokenizer.decode(t).strip() for t in tokens]
+
+            sum_logprobs: List[float] = [lp[i] for i, lp in zip(selected, sum_logprobs)]
+            avg_logprobs: List[float] = [
+                lp / (len(t) + 1) for t, lp in zip(tokens, sum_logprobs)
+            ]
+
+            fields = (
+                texts,
+                languages,
+                tokens,
+                audio_features,
+                avg_logprobs,
+                no_speech_probs,
             )
-            for text, language, tokens, features, avg_logprob, no_speech_prob in zip(
-                *fields
-            )
-        ]
+            if len(set(map(len, fields))) != 1:
+                raise RuntimeError(f"inconsistent result lengths: {list(map(len, fields))}")
+
+            return [
+                DecodingResult(
+                    audio_features=features,
+                    language=language,
+                    tokens=tokens,
+                    text=text,
+                    avg_logprob=avg_logprob,
+                    no_speech_prob=no_speech_prob,
+                    temperature=self.options.temperature,
+                    compression_ratio=compression_ratio(text),
+                )
+                for text, language, tokens, features, avg_logprob, no_speech_prob in zip(
+                    *fields
+                )
+            ]
 
 
 @torch.no_grad()
