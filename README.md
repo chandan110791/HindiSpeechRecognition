@@ -8,10 +8,7 @@ Model Training: Sequential fine-tuning of the Whisper model using Mel-Frequency 
 Fusion Techniques: Explored deep and shallow fusion methods for decoder optimization.
 Model Evaluation: Employed WER and CER metrics for robustness assessment.
 ## Contents
-DataProcessing/: Scripts and notebooks for data preprocessing.
-FeatureExtraction/: Code for extracting MFCCs and other relevant features.
-ModelTraining/: Training scripts and hyperparameter tuning configurations.
-Evaluation/: Evaluation scripts and comparison analysis with state-of-the-art models.
+WIP
 
 Contribution
 This work contributes to theoretical and practical advancements in speech recognition, particularly for Hindi language processing.
